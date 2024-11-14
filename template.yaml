@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS Well-Architected Tool Integration with AWS Compute Optimizer and AWS Trusted Advisor
+Resources:
+##########################################################################
+#   KMS Key                                               #
+##########################################################################
+  KMSKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: 'KMS Key for encrypting CloudWatch Logs, SNS and DynamoDB'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'Enable IAM User Permissions'
+            Effect: 'Allow'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Effect: 'Allow'
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt*'
+              - 'kms:Decrypt*'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:Describe*'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+          - Sid: "Allow OpsCenter Encryption and Decryption"
+            Effect: "Allow"
+            Principal:
+              Service: "ssm.amazonaws.com"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:GenerateDataKey*"
+            Resource: "*"      
+
+##########################################################################
+#   API Gateway                                                 #
+##########################################################################
+  ApiGatewayApi:
+    Type: AWS::Serverless::Api
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W68
+            reason: "API Gateway Usage Plan is not needed for this lab."
+          - id: W69
+            reason: "Access logs is not needed."
+          - id: W64
+            reason: "API Gateway Usage Plan is not needed for this lab." 
+    #checkov:skip=CKV_AWS_120:This check is ignored because we API Gateway caching isn't needed for this lab.
+    #checkov:skip=CKV_AWS_73: X-Ray Tracing is not needed for this lab.
+    #checkov:skip=CKV_AWS_76: API Gateway has Access Logging is not needed for this lab.
+    Properties:
+      StageName: Prod
+      EndpointConfiguration:
+        Type: REGIONAL
+##########################################################################
+#   Lambda Function                                                      #
+##########################################################################
+  WAIntegrations:
+    Type: AWS::Serverless::Function
+    Metadata:
+    #checkov:skip=CKV_AWS_116:This check is ignored because Dead Letter Queue(DLQ) isn't needed for this lab.
+    #checkov:skip=CKV_AWS_117:This Lambda function does not need to be in a VPC.
+    #checkov:skip=CKV_AWS_173:Environment KMS key is not needed.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "This Lambda function does not need to be in a VPC."
+          - id: W11
+            reason: "Using wildcard for resources in the IAM policy because ComputeOptimizer and TrustedAdvisor do not support resource-level permissions."
+    Properties:
+      ReservedConcurrentExecutions: 15
+      CodeUri: src/
+      Handler: app.handler
+      Runtime: nodejs14.x
+      Timeout: 10
+      Environment:
+        Variables:
+          DatabaseTable: !Ref MapEngineTable   
+      Policies:
+        ## Read more about SAM Policy templates at:
+        ## https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-policy-templates.html
+        - DynamoDBReadPolicy:
+            TableName: !Ref MapEngineTable
+        - EC2DescribePolicy: {}
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ComputeOptimizer
+              Effect: Allow
+              Action:
+                - 'compute-optimizer:GetEC2InstanceRecommendations'
+              Resource:
+                - '*'
+            - Sid: TrustedAdvisor
+              Effect: Allow
+              Action:
+                - 'support:DescribeTrustedAdvisorChecks'
+                - 'support:DescribeTrustedAdvisorCheckResult'
+              Resource:
+                - '*'
+            - Sid: WellArchitected
+              Effect: Allow
+              Action:
+                - 'wellarchitected:GetWorkload'
+                - 'wellarchitected:GetAnswer'
+                - 'wellarchitected:UpdateAnswer'
+                - 'wellarchitected:UpdateWorkload'
+                - 'wellarchitected:TagResource'
+                - 'wellarchitected:CreateMilestone'
+              Resource:
+                - !Sub 'arn:aws:wellarchitected:${AWS::Region}:${AWS::AccountId}:workload/*'
+                - !Sub 'arn:aws:wellarchitected:${AWS::Region}:${AWS::AccountId}:/workloadsSummaries'
+            - Sid: KMS
+              Effect: Allow
+              Action:
+                - 'kms:Encrypt'
+                - 'kms:Decrypt'
+                - 'kms:ReEncrypt*'
+                - 'kms:GenerateDataKey*'
+                - 'kms:DescribeKey'
+              Resource: !GetAtt [KMSKey, Arn]    
+# update dynamodb
+  LambdaPutDynamoDB:
+    Type: AWS::Serverless::Function
+    Metadata:
+    #checkov:skip=CKV_AWS_116:This check is ignored because Dead Letter Queue(DLQ) isn't needed for this lab.
+    #checkov:skip=CKV_AWS_117:This Lambda function does not need to be in a VPC.
+    #checkov:skip=CKV_AWS_173:Environment KMS key is not needed.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "This Lambda function does not need to be in a VPC."
+    Properties:
+      ReservedConcurrentExecutions: 15
+      CodeUri: src/dynamodb
+      Handler: mappingEngine.handler
+      Runtime: nodejs14.x
+      Timeout: 3
+      Environment:
+        Variables:
+          DatabaseTable: !Ref MapEngineTable  
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref MapEngineTable
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AllowAccessToKMS
+              Effect: Allow
+              Action:
+                - 'kms:Encrypt'
+                - 'kms:Decrypt'
+                - 'kms:ReEncrypt*'
+                - 'kms:GenerateDataKey*'
+                - 'kms:DescribeKey'
+              Resource: !GetAtt [KMSKey, Arn] 
+      Events:
+        HttpPost:
+          Type: Api
+          Properties:
+            Path: /
+            Method: POST
+            RestApiId:
+              Ref: ApiGatewayApi
+##########################################################################
+#   Amazon EventBridge Rule                                                            #
+##########################################################################       
+  WAEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Well-Architected Events Rule
+      EventPattern: 
+        source:
+        - aws.wellarchitected
+        detail:
+          eventName: 
+            - CreateWorkload
+      Name: WAEventRule
+      State: ENABLED
+      Targets:
+      - 
+        Arn: 
+          Fn::GetAtt:
+            - WAIntegrations
+            - Arn
+        Id: WAEventRulev1
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref WAIntegrations
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: 
+        Fn::GetAtt: 
+          - WAEventRule
+          - Arn
+##########################################################################
+#   DynamoDB                                                            #
+##########################################################################
+  MapEngineTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Resource naming - Table Name - is intentional to maintain state between stack updates."
+    Properties:
+      TableName: wa-mapping
+      AttributeDefinitions:
+      - AttributeName: PillarNumber
+        AttributeType: S
+      KeySchema:
+      - AttributeName: PillarNumber
+        KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: !Ref KMSKey
+        SSEType: 'KMS'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+##########################################################################
+#   OUTPUTS                                                              #
+##########################################################################
+  
+Outputs:
+  WAIntegrations:
+    Value: !Ref WAIntegrations
+    Description: WAIntegrations function Arn
+  
+  LambdaPutDynamoDB:
+    Value: !Ref LambdaPutDynamoDB
+    Description: LambdaPutDynamoDB function  Arn
+
+  DynamoDbTable:
+    Value: !Ref MapEngineTable
+    Description: DynamoDb Table 
+  
+  APIGWUrl:
+    Value:
+      Fn::Sub:
+      - https://${ServerlessRestApi}.execute-api.${Region}.amazonaws.com/Prod
+      - Region: !Ref AWS::Region
+        ServerlessRestApi: !Ref ApiGatewayApi
+    Description: Use this url to put items into MapEngineTable
